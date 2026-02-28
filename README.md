@@ -13,3 +13,11 @@ LINZO is not just a video conferencing tool — it is a complete accessibility c
 Enable anyone to communicate with anyone — regardless of hearing ability, speech capability, or language — in real time.
 
 ---
+All Rights Reserved
+
+Copyright (c) 2026 Sarang Kadukar and Team
+
+This source code is proprietary and confidential.
+Unauthorized copying, modification, distribution, or use is strictly prohibited.
+
+---
