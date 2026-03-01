@@ -1,5 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import Loader from './Loader';
+import { useTTS } from '../hooks/useTTS';
+
 
 const SignToVoice = ({ isActive, onTextDetected, onSpeechGenerated, onClose }) => {
   const videoRef = useRef(null);
@@ -12,6 +14,7 @@ const SignToVoice = ({ isActive, onTextDetected, onSpeechGenerated, onClose }) =
   const [detectedText, setDetectedText] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
   const [poseResults, setPoseResults] = useState(null);
+  const { speakText } = useTTS();
 
   // ISL Gesture Database with proper pose landmarks
   const islGestures = {
@@ -244,35 +247,6 @@ const SignToVoice = ({ isActive, onTextDetected, onSpeechGenerated, onClose }) =
     return gestureMap[gesture] || gesture;
   };
 
-  // Text to Speech using Web Speech API
-  const speakText = (text) => {
-    if ('speechSynthesis' in window) {
-      const utterance = new SpeechSynthesisUtterance(text);
-      utterance.lang = 'en-US';
-      utterance.rate = 0.9;
-      utterance.pitch = 1.0;
-      utterance.volume = 1.0;
-
-      // Get available voices and set a good one
-      const voices = speechSynthesis.getVoices();
-      const preferredVoice = voices.find(voice =>
-        voice.lang.includes('en') && voice.name.includes('Google')
-      ) || voices.find(voice => voice.lang.includes('en')) || voices[0];
-
-      if (preferredVoice) {
-        utterance.voice = preferredVoice;
-      }
-
-      speechSynthesis.speak(utterance);
-      console.log('🔊 Speaking:', text);
-
-      if (onSpeechGenerated) {
-        onSpeechGenerated(text);
-      }
-    } else {
-      console.error('❌ Speech synthesis not supported');
-    }
-  };
 
   // Start camera stream
   const startCamera = async () => {
