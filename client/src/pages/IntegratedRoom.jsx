@@ -30,8 +30,8 @@ const IntegratedRoom = () => {
   const [currentText, setCurrentText] = useState('');
   const [isSignLanguageActive, setIsSignLanguageActive] = useState(false);
   const [avatarType, setAvatarType] = useState('xbot');
-  const [animationSpeed, setAnimationSpeed] = useState(0.1);
-  const [pauseTime, setPauseTime] = useState(800);
+  const [animationSpeed, setAnimationSpeed] = useState(0.4);
+  const [pauseTime, setPauseTime] = useState(300);
   const [drawerTab, setDrawerTab] = useState('chat');
   const [user, setUser] = useState({ name: 'You', avatar: '' });
   const [isBackgroundListening, setIsBackgroundListening] = useState(false);
@@ -47,6 +47,11 @@ const IntegratedRoom = () => {
   const [isTranslationEnabled, setIsTranslationEnabled] = useState(false);
   const [preferredLanguage, setPreferredLanguage] = useState('en-US'); // Default to English (US)
   const [supportedLanguages, setSupportedLanguages] = useState([]);
+  const [isTTSPlaying, setIsTTSPlaying] = useState(false);
+
+  // User Type & Accessibility State
+  const [userType, setUserType] = useState(null); // 'normal', 'deaf', 'mute', null (unselected)
+  const [showAvatar, setShowAvatar] = useState(true); // Toggle for Deaf/Mute users
 
   // Meeting Summary State
   const [isSummaryEnabled, setIsSummaryEnabled] = useState(false);
@@ -58,16 +63,13 @@ const IntegratedRoom = () => {
   const recentTranscriptsRef = useRef([]);
   const userNameRef = useRef('');
 
-  // Conflict Resolution: Disable other speech features when summary is enabled
+  // Both Voice-to-Sign and Live Transcription can coexist safely
+  // They use different socket event types ('speech' vs 'transcript')
   useEffect(() => {
-    if (isSummaryEnabled) {
-      if (isBackgroundListening) {
-        setIsBackgroundListening(false);
-        console.log('🔇 Auto-disabled Background Listening to prevent conflicts');
-      }
+    if (isSummaryEnabled || isTranslationEnabled) {
       setShowTranscripts(true); // Auto-open panel
     }
-  }, [isSummaryEnabled]);
+  }, [isSummaryEnabled, isTranslationEnabled]);
 
   // Refs for State (to avoid stale closures in socket listeners)
   const isTranslationEnabledRef = useRef(isTranslationEnabled);
@@ -92,6 +94,11 @@ const IntegratedRoom = () => {
   const dataChannelsRef = useRef({});
   const [dataChannelStatus, setDataChannelStatus] = useState('Disconnected');
   const [isCallWidgetOpen, setIsCallWidgetOpen] = useState(false);
+
+  // Multilingual Speech Recognition (isolated, independent from NativeSpeechRecognition)
+  const multilingualRecRef = useRef(null);
+  const multilingualRestartTimerRef = useRef(null);
+  const multilingualAllowRestartRef = useRef(false);
 
   const participantVideoRefs = useRef({}); // START_LINE: 52
 
@@ -217,9 +224,15 @@ const IntegratedRoom = () => {
 
     socketRef.current.on('connect', () => {
       console.log('✅ Connected to server:', roomId, 'Socket ID:', socketRef.current.id);
-      console.log('✅ Connected to server:', roomId, 'Socket ID:', socketRef.current.id);
       setIsConnected(true);
       selfIdRef.current = socketRef.current.id;
+    });
+
+    // Transcription State Sync
+    socketRef.current.on('transcription-state', (data) => {
+      console.log(`🎤 [SOCKET] Received transcription-state: ${data.enabled}`);
+      setIsSummaryEnabled(data.enabled);
+      // Removed setShowTranscripts(data.enabled) so only the toggle works but the modal doesn't forcibly steal focus
     });
 
     socketRef.current.on('disconnect', () => {
@@ -269,6 +282,7 @@ const IntegratedRoom = () => {
     socketRef.current.on('transcription-state', ({ enabled }) => {
       console.log(`🎤 Received transcription-state sync: ${enabled}`);
       setIsSummaryEnabled(enabled);
+      setShowTranscripts(enabled); // Force the modal open/closed in sync
     });
 
     // Twilio transcription listener - for deaf/mute users to see what callee is saying
@@ -432,11 +446,15 @@ const IntegratedRoom = () => {
 
           const currentTime = audioCtx.currentTime;
           if (nextStartTime < currentTime) nextStartTime = currentTime;
+
+          setIsTTSPlaying(true);
+          source.onended = () => setIsTTSPlaying(false);
           source.start(nextStartTime);
           nextStartTime += buffer.duration;
 
         } catch (e) {
           console.error("Global Audio Decode Error:", e);
+          setIsTTSPlaying(false);
         }
       }
     });
@@ -498,7 +516,16 @@ const IntegratedRoom = () => {
     return recentTranscriptsRef.current.some(t => {
       if (t.source === excludeSource) return false; // Only check against the OTHER source
       const normalizedExisting = t.text.toLowerCase().trim();
-      return normalizedNew.includes(normalizedExisting) || normalizedExisting.includes(normalizedNew);
+
+      // Match if exactly the same
+      if (normalizedNew === normalizedExisting) return true;
+
+      // Match if one includes the other AND their lengths are very similar (e.g. slight transcription difference like "hello" vs "hello.")
+      if ((normalizedNew.includes(normalizedExisting) || normalizedExisting.includes(normalizedNew)) &&
+        Math.abs(normalizedNew.length - normalizedExisting.length) <= 3) {
+        return true;
+      }
+      return false;
     });
   }, []);
 
@@ -760,6 +787,8 @@ const IntegratedRoom = () => {
       window.speechSynthesis.cancel();
     }
 
+    setIsTTSPlaying(true); // Set playing state when starting new audio
+
     try {
       // 3. Use our own SERVER PROXY to avoid browser blocking
       // This hits http://localhost:5000/api/translate/tts which then fetches from Google
@@ -779,8 +808,19 @@ const IntegratedRoom = () => {
 
       console.log(`🔊 Fetching TTS from Proxy: "${text}" (${langCode})`);
 
+      // Safety timeout: if audio never fires ended/error, reset isTTSPlaying after 10s
+      const safetyTimeout = setTimeout(() => {
+        console.warn('⚠️ TTS safety timeout: resetting isTTSPlaying');
+        setIsTTSPlaying(false);
+        if (currentTTSAudioRef.current === audio) {
+          currentTTSAudioRef.current = null;
+        }
+      }, 10000);
+
       // Clean up reference when audio finishes
       audio.addEventListener('ended', () => {
+        clearTimeout(safetyTimeout);
+        setIsTTSPlaying(false); // Reset playing state on end
         if (currentTTSAudioRef.current === audio) {
           currentTTSAudioRef.current = null;
         }
@@ -788,6 +828,8 @@ const IntegratedRoom = () => {
 
       // Clean up reference on error
       audio.addEventListener('error', () => {
+        clearTimeout(safetyTimeout);
+        setIsTTSPlaying(false); // Reset playing state on error
         if (currentTTSAudioRef.current === audio) {
           currentTTSAudioRef.current = null;
         }
@@ -802,18 +844,25 @@ const IntegratedRoom = () => {
         if (currentTTSAudioRef.current === audio) {
           currentTTSAudioRef.current = null;
         }
+        setIsTTSPlaying(false); // Reset playing state if proxy audio fails
 
         // Final Fallback to Browser
         if ('speechSynthesis' in window) {
           console.log("⚠️ Fallback to Browser Native TTS...");
           const u = new SpeechSynthesisUtterance(text);
           u.lang = language || 'en-US';
+          u.onstart = () => setIsTTSPlaying(true);
+          u.onend = () => setIsTTSPlaying(false);
+          u.onerror = () => setIsTTSPlaying(false);
           window.speechSynthesis.speak(u);
+        } else {
+          setIsTTSPlaying(false); // If no fallback, ensure state is reset
         }
       });
 
     } catch (e) {
       console.error("❌ Google TTS setup failed:", e);
+      setIsTTSPlaying(false); // Reset playing state on setup failure
     }
   }, []);
 
@@ -950,16 +999,17 @@ const IntegratedRoom = () => {
     console.log('🎤 FINAL SPEECH DETECTED:', text);
     if (socketRef.current && text.trim()) {
       const messageId = Date.now();
+      const currentUserName = userNameRef.current || user.name || 'You';
 
       // 1. Show locally immediately (Consistency)
       const message = {
         id: messageId,
         text: text.trim(),
-        sender: user.name || 'You',
+        sender: currentUserName,
         timestamp: new Date().toLocaleTimeString()
       };
 
-      console.log(`🎤 [DEBUG] handleFinalSpeech - Sender: ${user.name}, SocketID: ${socketRef.current?.id}, SummaryEnabled: ${isSummaryEnabled}, BackgroundListening: ${isBackgroundListening}`);
+      console.log(`🎤 [DEBUG] handleFinalSpeech - Sender: ${currentUserName}, SocketID: ${socketRef.current?.id}, SummaryEnabled: ${isSummaryEnabled}, BackgroundListening: ${isBackgroundListening}`);
 
       setChatMessages(prev => [...prev, message]);
 
@@ -968,7 +1018,7 @@ const IntegratedRoom = () => {
         const newCaption = {
           id: messageId,
           text: text.trim(),
-          speaker: 'You', // Or user.name
+          speaker: currentUserName, // Explicitly use the resolved name
           timestamp: new Date().toLocaleTimeString()
         };
         return [...prev, newCaption].slice(-50);
@@ -978,13 +1028,12 @@ const IntegratedRoom = () => {
       recentTranscriptsRef.current.push({
         text: text.trim(),
         source: 'local',
-        speaker: 'You',
+        speaker: currentUserName,
         timestamp: Date.now()
       });
 
       // 2. Emit speech-translation (Avatar/TTS Control)
       // ONLY emit this if "Voice -> Sign" (Background Listening) is enabled.
-      // This decoupled flow prevents unwanted Avatar/TTS when just usage Live Transcript.
       if (isBackgroundListening) {
         socketRef.current.emit('speech-translation', {
           id: messageId,
@@ -993,7 +1042,7 @@ const IntegratedRoom = () => {
           sourceLang: preferredLanguageRef.current || 'en-US',
           targetLang: 'en',
           from: socketRef.current.id,
-          sender: user.name || 'You',
+          sender: currentUserName,
           type: 'speech' // triggers Avatar/TTS on peers
         });
       }
@@ -1003,19 +1052,20 @@ const IntegratedRoom = () => {
       if (isSummaryEnabled) {
         // Broadcast for peers
         socketRef.current.emit('speech-translation', {
+          roomId,
           text: text.trim(),
-          sourceLang: 'en',
+          sourceLang: preferredLanguageRef.current || 'en-US',
           targetLang: 'en',
           from: socketRef.current.id,
-          sender: user.name || 'You', // Standardize 'sender' field
-          speakerName: user.name || 'You', // Keep for compatibility
-          type: 'transcript' // triggers Captions only on peers
+          sender: currentUserName,
+          speakerName: currentUserName,
+          type: 'transcript'
         });
 
         // Send to backend
         try {
           api.post(`/meetings/${roomId}/transcript`, {
-            speaker: user.name || 'You',
+            speaker: currentUserName,
             text: text.trim()
           });
         } catch (err) {
@@ -1024,7 +1074,147 @@ const IntegratedRoom = () => {
       }
 
     }
-  }, [roomId, user.name, isSummaryEnabled, isBackgroundListening, isMuted]); // Added isMuted dependency
+  }, [roomId, user.name, isSummaryEnabled, isBackgroundListening, isMuted]);
+
+  // ============================================================
+  // ISOLATED MULTILINGUAL SPEECH SYSTEM (ported from MultiCallRoom.jsx)
+  // Completely independent from NativeSpeechRecognition component
+  // ============================================================
+  useEffect(() => {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) return;
+    if (!isTranslationEnabled) {
+      // Clean up if translation was disabled
+      multilingualAllowRestartRef.current = false;
+      if (multilingualRestartTimerRef.current) clearTimeout(multilingualRestartTimerRef.current);
+      try { multilingualRecRef.current?.stop?.(); } catch { }
+      multilingualRecRef.current = null;
+      return;
+    }
+
+    // Stop any existing instance
+    try { multilingualRecRef.current?.stop?.(); } catch { }
+
+    const rec = new SpeechRecognition();
+    multilingualRecRef.current = rec;
+
+    const lang = preferredLanguage || 'en-US';
+    rec.lang = lang;
+    rec.interimResults = false; // Final results only — avoids flooding
+    rec.continuous = true;
+    rec.maxAlternatives = 1;
+
+    multilingualAllowRestartRef.current = true;
+    let isProcessing = false;
+    let lastResultTime = 0;
+
+    rec.onresult = (e) => {
+      const now = Date.now();
+      if (isProcessing || (now - lastResultTime) < 500) return;
+      isProcessing = true;
+      lastResultTime = now;
+
+      let finalText = '';
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        if (e.results[i].isFinal) {
+          finalText += (finalText ? ' ' : '') + e.results[i][0].transcript.trim();
+        }
+      }
+
+      if (!finalText || finalText.length < 2) {
+        isProcessing = false;
+        return;
+      }
+
+      const myLang = preferredLanguageRef.current || preferredLanguage || 'en-US';
+      const currentUserName = userNameRef.current || user.name || 'You';
+      console.log(`🌐 [MULTILINGUAL] I spoke: "${finalText}" in ${myLang}`);
+
+      // Add to local captions
+      const captionId = 'ml-' + Date.now();
+      setCaptions(prev => [...prev, {
+        id: captionId,
+        text: finalText,
+        speaker: currentUserName,
+        timestamp: new Date().toLocaleTimeString()
+      }].slice(-50));
+
+      // Emit speech-translation for peers (TTS + Avatar)
+      if (socketRef.current) {
+        socketRef.current.emit('speech-translation', {
+          id: Date.now(),
+          roomId,
+          text: finalText,
+          sourceLang: myLang,
+          targetLang: 'en',
+          from: socketRef.current.id,
+          sender: currentUserName,
+          type: 'speech'
+        });
+        // Also emit transcript for captions on peer
+        socketRef.current.emit('speech-translation', {
+          roomId,
+          text: finalText,
+          sourceLang: myLang,
+          targetLang: 'en',
+          from: socketRef.current.id,
+          sender: currentUserName,
+          speakerName: currentUserName,
+          type: 'transcript'
+        });
+      }
+
+      setTimeout(() => { isProcessing = false; }, 1000);
+    };
+
+    rec.onstart = () => {
+      console.log('🌐 [MULTILINGUAL] Speech recognition started');
+    };
+
+    rec.onend = () => {
+      console.log('🌐 [MULTILINGUAL] Speech recognition ended');
+      if (!multilingualAllowRestartRef.current) return;
+      if (multilingualRestartTimerRef.current) clearTimeout(multilingualRestartTimerRef.current);
+      multilingualRestartTimerRef.current = setTimeout(() => {
+        if (multilingualAllowRestartRef.current && multilingualRecRef.current === rec) {
+          try {
+            rec.start();
+            console.log('🌐 [MULTILINGUAL] Auto-restarted');
+          } catch (e) {
+            console.warn('🌐 [MULTILINGUAL] Restart failed:', e.message);
+          }
+        }
+      }, 1000);
+    };
+
+    rec.onerror = (e) => {
+      console.warn('🌐 [MULTILINGUAL] Error:', e.error);
+      isProcessing = false;
+      if (e.error === 'no-speech' || e.error === 'audio-capture' || e.error === 'aborted') {
+        // These are recoverable — onend will auto-restart
+      } else if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+        multilingualAllowRestartRef.current = false;
+      }
+    };
+
+    // Start recognition
+    try {
+      rec.start();
+      console.log(`🌐 [MULTILINGUAL] Started in ${lang}`);
+    } catch (e) {
+      console.warn('🌐 [MULTILINGUAL] Initial start failed:', e.message);
+      setTimeout(() => {
+        try { rec.start(); } catch { }
+      }, 1000);
+    }
+
+    return () => {
+      multilingualAllowRestartRef.current = false;
+      if (multilingualRestartTimerRef.current) clearTimeout(multilingualRestartTimerRef.current);
+      try { rec.stop(); } catch { }
+      multilingualRecRef.current = null;
+    };
+  }, [isTranslationEnabled, preferredLanguage, roomId, user.name]);
 
   // Memoize listening change handler to prevent restart loops
   const handleListeningChange = useCallback((listening) => {
@@ -1032,6 +1222,8 @@ const IntegratedRoom = () => {
     if (isBackgroundListening) {
       setIsSignLanguageActive(listening);
     }
+    // ALWAYS update UI status for Transcript panel
+    setIsSpeechActive(listening);
   }, [isBackgroundListening]);
 
   const handleAnimationComplete = () => {
@@ -1397,6 +1589,51 @@ const IntegratedRoom = () => {
 
   return (
     <div className="min-h-screen bg-[#f6f8fb] font-sans">
+      {/* User Type Onboarding Modal */}
+      {userType === null && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-6 text-center animate-in fade-in zoom-in duration-300">
+            <h2 className="text-2xl font-bold text-gray-900 mb-2">Welcome to Linzo Meet</h2>
+            <p className="text-gray-600 mb-6 text-sm">Please select your profile to optimize your meeting experience.</p>
+
+            <div className="grid gap-3">
+              <button
+                onClick={() => setUserType('normal')}
+                className="w-full flex items-center justify-between p-4 rounded-xl border-2 border-transparent bg-gray-50 hover:bg-indigo-50 hover:border-indigo-500 transition-all text-left flex-row-reverse sm:flex-row group"
+              >
+                <div>
+                  <div className="font-semibold text-gray-900 group-hover:text-indigo-700">Normal / Hearing</div>
+                  <div className="text-xs text-gray-500 mt-1">Standard meeting experience</div>
+                </div>
+                <div className="bg-white p-2 rounded-full shadow-sm text-lg order-first sm:order-last mr-3 sm:mr-0">🎧</div>
+              </button>
+
+              <button
+                onClick={() => setUserType('deaf')}
+                className="w-full flex items-center justify-between p-4 rounded-xl border-2 border-transparent bg-gray-50 hover:bg-emerald-50 hover:border-emerald-500 transition-all text-left flex-row-reverse sm:flex-row group"
+              >
+                <div>
+                  <div className="font-semibold text-gray-900 group-hover:text-emerald-700">Deaf / Hard of Hearing</div>
+                  <div className="text-xs text-gray-500 mt-1">Sign language & captions prioritized</div>
+                </div>
+                <div className="bg-white p-2 rounded-full shadow-sm text-lg order-first sm:order-last mr-3 sm:mr-0">🦻</div>
+              </button>
+
+              <button
+                onClick={() => setUserType('mute')}
+                className="w-full flex items-center justify-between p-4 rounded-xl border-2 border-transparent bg-gray-50 hover:bg-purple-50 hover:border-purple-500 transition-all text-left flex-row-reverse sm:flex-row group"
+              >
+                <div>
+                  <div className="font-semibold text-gray-900 group-hover:text-purple-700">Mute / Non-Verbal</div>
+                  <div className="text-xs text-gray-500 mt-1">Sign-to-voice & typing prioritized</div>
+                </div>
+                <div className="bg-white p-2 rounded-full shadow-sm text-lg order-first sm:order-last mr-3 sm:mr-0">🤟</div>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Top Bar */}
       <header className="sticky top-0 z-20 bg-white/95 backdrop-blur supports-[backdrop-filter]:bg-white/80 border-b border-gray-200 flex items-center justify-between px-3 sm:px-6 h-14 sm:h-16">
         <div className="flex items-center gap-2 sm:gap-3">
@@ -1560,125 +1797,95 @@ const IntegratedRoom = () => {
         />
         {/* Interpreter focus layout */}
         <div className="flex-1 relative flex flex-col lg:flex-row gap-4 p-2 sm:p-4 min-h-[50vh] lg:min-h-0">
-          {/* Left: Large AI Interpreter */}
-          <div className="flex-1 bg-white rounded-2xl shadow-lg hover:shadow-xl ring-1 ring-gray-200 overflow-hidden relative min-h-[30vh] sm:min-h-[60vh]">
-            <div className="absolute z-10 bottom-3 left-3 bg-[#684CFE] text-white px-3 py-1 rounded-full text-xs sm:text-sm flex items-center gap-1 shadow">
-              <span>🤖</span> AI Interpreter
-              {isSignLanguageActive && (
-                <div className="ml-2 flex items-center gap-1">
-                  <div className="w-2 h-2 bg-green-400 rounded-full animate-pulse"></div>
-                  <span className="text-xs">LIVE</span>
-                </div>
-              )}
-              {isBackgroundListening && (
-                <div className="ml-2 flex items-center gap-1">
-                  <div className="w-2 h-2 bg-orange-400 rounded-full animate-pulse"></div>
-                  <span className="text-xs">🎤</span>
-                </div>
-              )}
-              {isSignToVoiceActive && (
-                <div className="ml-2 flex items-center gap-1">
-                  <div className="w-2 h-2 bg-purple-400 rounded-full animate-pulse"></div>
-                  <span className="text-xs">🤟</span>
-                </div>
+          {/* Left: Large AI Interpreter - Only for Deaf/Mute users */}
+          {userType !== 'normal' && (
+            <div className={`transition-all duration-300 ${showAvatar ? 'flex-1 min-h-[30vh] sm:min-h-[60vh] bg-white rounded-2xl shadow-lg hover:shadow-xl ring-1 ring-gray-200 overflow-hidden relative' : ''}`}>
+
+              {/* See in Signs Toggle Button */}
+              <div className="absolute z-20 top-3 left-3">
+                <button
+                  onClick={() => setShowAvatar(!showAvatar)}
+                  className={`px-4 py-2 rounded-full text-sm font-semibold shadow-md transition-all flex items-center gap-2 ${showAvatar ? 'bg-indigo-600 text-white hover:bg-indigo-700' : 'bg-white text-indigo-600 ring-1 ring-indigo-200 hover:bg-indigo-50'}`}
+                >
+                  {showAvatar ? '🤟 Hide Sign Avatar' : '🤟 See in Signs'}
+                </button>
+              </div>
+
+              {showAvatar && (
+                <>
+                  <div className="absolute z-10 bottom-3 left-3 bg-[#684CFE] text-white px-3 py-1 rounded-full text-xs sm:text-sm flex items-center gap-1 shadow">
+                    <span>🤖</span> AI Interpreter
+                    {isSignLanguageActive && (
+                      <div className="ml-2 flex items-center gap-1">
+                        <div className="w-2 h-2 bg-green-400 rounded-full animate-pulse"></div>
+                        <span className="text-xs">LIVE</span>
+                      </div>
+                    )}
+                    {isBackgroundListening && (
+                      <div className="ml-2 flex items-center gap-1">
+                        <div className="w-2 h-2 bg-orange-400 rounded-full animate-pulse"></div>
+                        <span className="text-xs">🎤</span>
+                      </div>
+                    )}
+                    {isSignToVoiceActive && (
+                      <div className="ml-2 flex items-center gap-1">
+                        <div className="w-2 h-2 bg-purple-400 rounded-full animate-pulse"></div>
+                        <span className="text-xs">🤟</span>
+                      </div>
+                    )}
+                  </div>
+                  {false && (
+                    <div className="absolute z-10 top-3 right-3 flex flex-col gap-2">
+                      <div className="flex gap-2">
+                        <button onClick={() => setAvatarType('xbot')} className={`px-3 py-1 rounded text-xs font-bold ring-1 ${avatarType === 'xbot' ? 'bg-blue-600 text-white ring-blue-600' : 'bg-white text-gray-700 ring-gray-200 hover:bg-gray-50'}`}>XBOT</button>
+                        <button onClick={() => setAvatarType('ybot')} className={`px-3 py-1 rounded text-xs font-bold ring-1 ${avatarType === 'ybot' ? 'bg-blue-600 text-white ring-blue-600' : 'bg-white text-gray-700 ring-gray-200 hover:bg-gray-50'}`}>YBOT</button>
+                        <button onClick={() => setAvatarType('humanoid')} className={`px-3 py-1 rounded text-xs font-bold ring-1 ${avatarType === 'humanoid' ? 'bg-blue-600 text-white ring-blue-600' : 'bg-white text-gray-700 ring-gray-200 hover:bg-gray-50'}`}>HUMANOID</button>
+                      </div>
+
+                      {/* Animation Speed Slider */}
+                      <div className="bg-white rounded-lg p-2 shadow-lg border border-gray-200">
+                        <div className="text-xs font-medium text-gray-700 mb-1">Speed: {Math.round(animationSpeed * 100) / 100}</div>
+                        <input
+                          type="range"
+                          min="0.05"
+                          max="0.50"
+                          step="0.01"
+                          value={animationSpeed}
+                          onChange={(e) => setAnimationSpeed(parseFloat(e.target.value))}
+                          className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer slider"
+                        />
+                      </div>
+
+                      {/* Pause Time Slider */}
+                      <div className="bg-white rounded-lg p-2 shadow-lg border border-gray-200">
+                        <div className="text-xs font-medium text-gray-700 mb-1">Pause: {pauseTime}ms</div>
+                        <input
+                          type="range"
+                          min="0"
+                          max="2000"
+                          step="100"
+                          value={pauseTime}
+                          onChange={(e) => setPauseTime(parseInt(e.target.value))}
+                          className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer slider"
+                        />
+                      </div>
+                    </div>
+                  )}
+                  <SignLanguageAvatar
+                    text={currentText}
+                    isActive={isSignLanguageActive}
+                    avatarType={avatarType}
+                    animationSpeed={animationSpeed}
+                    pauseTime={pauseTime}
+                    onAnimationComplete={handleAnimationComplete}
+                  />
+                </>
               )}
             </div>
-            {false && (
-              <div className="absolute z-10 top-3 right-3 flex flex-col gap-2">
-                <div className="flex gap-2">
-                  <button onClick={() => setAvatarType('xbot')} className={`px-3 py-1 rounded text-xs font-bold ring-1 ${avatarType === 'xbot' ? 'bg-blue-600 text-white ring-blue-600' : 'bg-white text-gray-700 ring-gray-200 hover:bg-gray-50'}`}>XBOT</button>
-                  <button onClick={() => setAvatarType('ybot')} className={`px-3 py-1 rounded text-xs font-bold ring-1 ${avatarType === 'ybot' ? 'bg-blue-600 text-white ring-blue-600' : 'bg-white text-gray-700 ring-gray-200 hover:bg-gray-50'}`}>YBOT</button>
-                  <button onClick={() => setAvatarType('humanoid')} className={`px-3 py-1 rounded text-xs font-bold ring-1 ${avatarType === 'humanoid' ? 'bg-blue-600 text-white ring-blue-600' : 'bg-white text-gray-700 ring-gray-200 hover:bg-gray-50'}`}>HUMANOID</button>
-                </div>
-
-                {/* Animation Speed Slider */}
-                <div className="bg-white rounded-lg p-2 shadow-lg border border-gray-200">
-                  <div className="text-xs font-medium text-gray-700 mb-1">Speed: {Math.round(animationSpeed * 100) / 100}</div>
-                  <input
-                    type="range"
-                    min="0.05"
-                    max="0.50"
-                    step="0.01"
-                    value={animationSpeed}
-                    onChange={(e) => setAnimationSpeed(parseFloat(e.target.value))}
-                    className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer slider"
-                  />
-                </div>
-
-                {/* Pause Time Slider */}
-                <div className="bg-white rounded-lg p-2 shadow-lg border border-gray-200">
-                  <div className="text-xs font-medium text-gray-700 mb-1">Pause: {pauseTime}ms</div>
-                  <input
-                    type="range"
-                    min="0"
-                    max="2000"
-                    step="100"
-                    value={pauseTime}
-                    onChange={(e) => setPauseTime(parseInt(e.target.value))}
-                    className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer slider"
-                  />
-                </div>
-              </div>
-            )}
-            <SignLanguageAvatar
-              text={currentText}
-              isActive={isSignLanguageActive}
-              avatarType={avatarType}
-              animationSpeed={animationSpeed}
-              pauseTime={pauseTime}
-              onAnimationComplete={handleAnimationComplete}
-            />
-          </div>
+          )}
           {/* Right: Sidebar tiles - widened */}
-          <div className="w-full lg:w-[420px] flex flex-col gap-4">
-
-            {/* Live Transcript Panel */}
-            {showTranscripts && (
-              <div className="bg-white rounded-2xl shadow-md ring-1 ring-gray-200 overflow-hidden flex flex-col max-h-[40vh] transition-all duration-300 ease-in-out">
-                <div className="p-3 border-b border-gray-100 bg-gray-50/50 flex justify-between items-center">
-                  <h3 className="font-semibold text-gray-900 flex items-center gap-2 text-sm">
-                    <svg className="w-4 h-4 text-indigo-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" />
-                    </svg>
-                    Live Transcript
-                  </h3>
-                  <div className="flex items-center gap-2">
-                    <span className={`w-2 h-2 rounded-full ${isSpeechActive ? 'bg-emerald-500 animate-pulse' : 'bg-gray-300'}`}></span>
-                    <span className="text-[10px] text-gray-500 font-medium">{isSpeechActive ? 'Listening' : 'Paused'}</span>
-                    <button onClick={() => setShowTranscripts(false)} className="ml-2 text-gray-400 hover:text-gray-600" title="Hide (Speech capture continues)">
-                      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
-                    </button>
-                  </div>
-                </div>
-                <div className="flex-1 overflow-y-auto p-3 space-y-3 custom-scrollbar bg-gray-50/30">
-                  {captions.length === 0 ? (
-                    <div className="text-center text-gray-400 py-8">
-                      <p className="text-xs">Start speaking to see live captions...</p>
-                    </div>
-                  ) : (
-                    captions.map(c => {
-                      const isMe = c.speaker === 'You' || c.speaker === (userNameRef.current || user.name);
-                      return (
-                        <div key={c.id} className={`flex w-full ${isMe ? 'justify-start' : 'justify-end'}`}>
-                          <div className={`max-w-[85%] rounded-xl px-3 py-2 shadow-sm ${isMe
-                            ? 'bg-indigo-600 text-white rounded-tl-none'
-                            : 'bg-white border border-gray-200 text-gray-800 rounded-tr-none'
-                            }`}>
-                            <div className={`text-[10px] font-bold uppercase tracking-wide mb-0.5 ${isMe ? 'text-indigo-200' : 'text-indigo-600'}`}>
-                              {c.speaker}
-                            </div>
-                            <p className="text-xs leading-relaxed">{c.text}</p>
-                            <div className={`text-[9px] mt-0.5 text-right ${isMe ? 'text-indigo-200' : 'text-gray-400'}`}>
-                              {c.timestamp}
-                            </div>
-                          </div>
-                        </div>
-                      );
-                    })
-                  )}
-                </div>
-              </div>
-            )}
+          <div className={`w-full ${userType === 'normal' || !showAvatar ? 'flex-1 relative' : 'lg:w-[420px]'} flex flex-col gap-4`}>
+            {/* Rendered below as a modal instead */}
             {/* Seamless Voice Recognition Info */}
             {/* <div className="bg-white rounded-2xl p-4 border border-gray-200 shadow-sm">
               <div className="flex items-center gap-2 mb-2">
@@ -1718,135 +1925,138 @@ const IntegratedRoom = () => {
                 </div>
               )}
             </div> */}
-            {/* Local tile (camera feed a bit larger) */}
-            <div className="bg-white rounded-2xl shadow-md ring-1 ring-slate-200 overflow-hidden relative aspect-[16/9]">
-              <video ref={localVideoRef} autoPlay muted playsInline className="w-full h-full object-cover bg-black transform scale-x-[-1]" />
-              <div className="absolute top-2 left-2 bg-black/60 text-white px-3 py-1 rounded-full text-xs shadow">You</div>
-              {isMuted && <div className="absolute top-2 right-2 bg-red-500 text-white px-2 py-1 rounded-full text-xs">🔇</div>}
-              {isVideoOff && <div className="absolute top-10 right-2 bg-red-500 text-white px-2 py-1 rounded-full text-xs">📹 Off</div>}
+            {/* Video Gallery Container */}
+            <div className={`flex-1 overflow-y-auto pr-1 pb-4 flex ${userType === 'normal' || !showAvatar ? 'flex-row flex-wrap justify-center content-start' : 'flex-col'} gap-4`}>
+              {/* Local tile */}
+              <div className={`bg-gray-900 rounded-2xl shadow-md ring-1 ring-slate-200 overflow-hidden relative flex-shrink-0 ${userType === 'normal' || !showAvatar ? 'w-full md:w-[calc(50%-0.5rem)] xl:w-[calc(33.33%-0.5rem)] max-w-4xl aspect-video' : 'aspect-[16/9]'}`}>
+                <video ref={localVideoRef} autoPlay muted playsInline className={`w-full h-full transform scale-x-[-1] ${userType === 'normal' || !showAvatar ? 'object-contain' : 'object-cover bg-black'}`} />
+                <div className="absolute top-2 left-2 bg-black/60 text-white px-3 py-1 rounded-full text-xs shadow">You</div>
+                {isMuted && <div className="absolute top-2 right-2 bg-red-500 text-white px-2 py-1 rounded-full text-xs">🔇</div>}
+                {isVideoOff && <div className="absolute top-10 right-2 bg-red-500 text-white px-2 py-1 rounded-full text-xs">📹 Off</div>}
 
-              {/* Conditionally render the pose detection overlay for SignToVoice or ISL Typing */}
-              {(isSignToVoiceActive || isISLTypingActive) && (
-                <div className="absolute inset-0 z-10">
-                  {isSignToVoiceActive ? (
-                    <div className="flex-1 h-full bg-gray-900 rounded-2xl overflow-hidden relative ring-1 ring-gray-800 shadow-2xl">
-                      <GeminiLiveStream
-                        roomId={roomId}
-                        isActive={isSignToVoiceActive}
-                        socketRef={socketRef}
+                {/* Conditionally render the pose detection overlay for SignToVoice or ISL Typing */}
+                {(isSignToVoiceActive || isISLTypingActive) && (
+                  <div className="absolute inset-0 z-10">
+                    {isSignToVoiceActive ? (
+                      <div className="flex-1 h-full bg-gray-900 rounded-2xl overflow-hidden relative ring-1 ring-gray-800 shadow-2xl">
+                        <GeminiLiveStream
+                          roomId={roomId}
+                          isActive={isSignToVoiceActive}
+                          socketRef={socketRef}
+                          onStreamReady={(stream) => {
+                            console.log('🎥 Stream ready from GeminiLiveStream');
+                            // Use switchStream helper to handle all updates (video, peer tracks, etc.)
+                            switchStream(stream);
+
+                            // Join the room after we have the local media stream
+                            const emitJoin = () => {
+                              if (!hasJoinedRef.current) {
+                                console.log('🚀 Joining room with webcam stream:', roomId);
+                                socketRef.current.emit('join-room', roomId);
+                                hasJoinedRef.current = true;
+                              }
+                            };
+                            if (socketRef.current?.connected) {
+                              emitJoin();
+                            } else {
+                              socketRef.current?.once('connect', emitJoin);
+                            }
+                          }}
+                          onTextDetected={(text) => {
+                            console.log('🤟 Gemini detected:', text);
+                            if (!text) return;
+
+                            setDetectedISLText(text); // Update UI
+
+                            // Avoid repeating same text immediately
+                            if (text === lastSpokenTextRef.current) return;
+                            lastSpokenTextRef.current = text;
+
+                            // Speak locally (DISABLED by user request - only remote should hear)
+                            // window.speechSynthesis.cancel();
+                            // const u = new SpeechSynthesisUtterance(text);
+                            // window.speechSynthesis.speak(u);
+
+                            // Broadcast TTS to peers
+                            if (socketRef.current) {
+                              socketRef.current.emit('speech-translation', {
+                                roomId,
+                                text: text,
+                                sourceLang: preferredLanguageRef.current || 'en-US',
+                                targetLang: 'en',
+                                sender: userNameRef.current || user.name || 'Me (Signer)'
+                              });
+                            }
+
+                            // Clear text after delay
+                            setTimeout(() => setDetectedISLText(''), 3000);
+                          }}
+                        />
+                      </div>
+                    ) : (
+                      /* Legacy Local Model for Alphabet/Typing Mode */
+                      <VideoWithPoseDetection
+                        isActive={isISLTypingActive}
+                        mode="alphabet"
+                        onTextDetected={handleSignTextDetected}
+                        onSpeechGenerated={handleSignSpeechGenerated}
+                        onAlphabetLetter={handleAlphabetLetter}
+                        onAlphabetControlGesture={handleAlphabetControlGesture}
+                        useClientAlphabetModel={useClientAlphabetModel}
                         onStreamReady={(stream) => {
-                          console.log('🎥 Stream ready from GeminiLiveStream');
-                          // Use switchStream helper to handle all updates (video, peer tracks, etc.)
+                          console.log('🎥 Stream ready from VideoWithPoseDetection');
                           switchStream(stream);
-
-                          // Join the room after we have the local media stream
+                          // Join room logic
                           const emitJoin = () => {
                             if (!hasJoinedRef.current) {
-                              console.log('🚀 Joining room with webcam stream:', roomId);
                               socketRef.current.emit('join-room', roomId);
                               hasJoinedRef.current = true;
                             }
                           };
-                          if (socketRef.current?.connected) {
-                            emitJoin();
-                          } else {
-                            socketRef.current?.once('connect', emitJoin);
-                          }
-                        }}
-                        onTextDetected={(text) => {
-                          console.log('🤟 Gemini detected:', text);
-                          if (!text) return;
-
-                          setDetectedISLText(text); // Update UI
-
-                          // Avoid repeating same text immediately
-                          if (text === lastSpokenTextRef.current) return;
-                          lastSpokenTextRef.current = text;
-
-                          // Speak locally (DISABLED by user request - only remote should hear)
-                          // window.speechSynthesis.cancel();
-                          // const u = new SpeechSynthesisUtterance(text);
-                          // window.speechSynthesis.speak(u);
-
-                          // Broadcast TTS to peers
-                          if (socketRef.current) {
-                            socketRef.current.emit('speech-translation', {
-                              roomId,
-                              text: text,
-                              sender: 'Me (Signer)'
-                            });
-                          }
-
-                          // Clear text after delay
-                          setTimeout(() => setDetectedISLText(''), 3000);
+                          if (socketRef.current?.connected) emitJoin();
+                          else socketRef.current?.once('connect', emitJoin);
                         }}
                       />
-                    </div>
-                  ) : (
-                    /* Legacy Local Model for Alphabet/Typing Mode */
-                    <VideoWithPoseDetection
-                      isActive={isISLTypingActive}
-                      mode="alphabet"
-                      onTextDetected={handleSignTextDetected}
-                      onSpeechGenerated={handleSignSpeechGenerated}
-                      onAlphabetLetter={handleAlphabetLetter}
-                      onAlphabetControlGesture={handleAlphabetControlGesture}
-                      useClientAlphabetModel={useClientAlphabetModel}
-                      onStreamReady={(stream) => {
-                        console.log('🎥 Stream ready from VideoWithPoseDetection');
-                        switchStream(stream);
-                        // Join room logic
-                        const emitJoin = () => {
-                          if (!hasJoinedRef.current) {
-                            socketRef.current.emit('join-room', roomId);
-                            hasJoinedRef.current = true;
-                          }
-                        };
-                        if (socketRef.current?.connected) emitJoin();
-                        else socketRef.current?.once('connect', emitJoin);
-                      }}
-                    />
-                  )}
-                </div>
-              )}
-              {/* ISL Typing overlay UI */}
-              {isISLTypingActive && (
-                <div className="absolute bottom-2 left-2 right-2 z-20">
-                  <div className="bg-black/60 text-white rounded-lg p-2 text-xs flex flex-col gap-1">
-                    <div className="flex items-center gap-2">
-                      <span className="opacity-70">Word</span>
-                      <span className="font-mono bg-white/10 px-2 py-0.5 rounded">
-                        {typedPrefix || '—'}
-                      </span>
-                      {currentSuggestion && currentSuggestion.toLowerCase() !== typedPrefix.toLowerCase() && (
-                        <span className="ml-2 opacity-70">→</span>
-                      )}
-                      {currentSuggestion && currentSuggestion.toLowerCase() !== typedPrefix.toLowerCase() && (
-                        <span className="font-mono bg-green-500/20 px-2 py-0.5 rounded">{currentSuggestion}</span>
-                      )}
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <span className="opacity-70">Sentence</span>
-                      <span className="truncate">{(composedSentence + typedPrefix).trim() || '—'}</span>
-                    </div>
-                    <div className="opacity-70">
-                      Gestures: Yes=Accept, No=Next, Hello=Commit word, Help=Backspace, Thank you=Finalize
+                    )}
+                  </div>
+                )}
+                {/* ISL Typing overlay UI */}
+                {isISLTypingActive && (
+                  <div className="absolute bottom-2 left-2 right-2 z-20">
+                    <div className="bg-black/60 text-white rounded-lg p-2 text-xs flex flex-col gap-1">
+                      <div className="flex items-center gap-2">
+                        <span className="opacity-70">Word</span>
+                        <span className="font-mono bg-white/10 px-2 py-0.5 rounded">
+                          {typedPrefix || '—'}
+                        </span>
+                        {currentSuggestion && currentSuggestion.toLowerCase() !== typedPrefix.toLowerCase() && (
+                          <span className="ml-2 opacity-70">→</span>
+                        )}
+                        {currentSuggestion && currentSuggestion.toLowerCase() !== typedPrefix.toLowerCase() && (
+                          <span className="font-mono bg-green-500/20 px-2 py-0.5 rounded">{currentSuggestion}</span>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="opacity-70">Sentence</span>
+                        <span className="truncate">{(composedSentence + typedPrefix).trim() || '—'}</span>
+                      </div>
+                      <div className="opacity-70">
+                        Gestures: Yes=Accept, No=Next, Hello=Commit word, Help=Backspace, Thank you=Finalize
+                      </div>
                     </div>
                   </div>
-                </div>
-              )}
-            </div>
-            {/* Remote participants small tiles */}
-            <div className="flex-1 overflow-auto flex flex-col gap-4 pr-1">
+                )}
+              </div>
+              {/* Remote participants */}
               {participants.length > 0 ? (
                 participants.map((participant, index) => (
-                  <div key={participant.id} className="bg-white rounded-2xl shadow-md ring-1 ring-gray-200 overflow-hidden relative aspect-video">
+                  <div key={participant.id} className={`bg-gray-900 rounded-2xl shadow-md ring-1 ring-gray-200 overflow-hidden relative flex-shrink-0 ${userType === 'normal' || !showAvatar ? 'w-full md:w-[calc(50%-0.5rem)] xl:w-[calc(33.33%-0.5rem)] max-w-4xl aspect-video' : 'aspect-video'}`}>
                     <video
                       key={participant.stream?.id || 'no-stream'}
                       ref={(el) => setParticipantVideoRef(participant.id, el)}
                       autoPlay
                       playsInline
-                      className="w-full h-full object-cover border-2 border-red-500 bg-gray-800"
+                      className={`w-full h-full border-2 border-red-500 bg-gray-900 ${userType === 'normal' || !showAvatar ? 'object-contain' : 'object-cover'}`}
                     />
                     <div className="absolute top-2 left-2 bg-black/60 text-white px-2 py-0.5 rounded-full text-xs shadow">Participant {index + 1}</div>
                     {/* Remote Mute/Video Status Icons */}
@@ -1859,9 +2069,11 @@ const IntegratedRoom = () => {
                   </div>
                 ))
               ) : (
-                <div className="bg-white rounded-2xl shadow-md ring-1 ring-gray-200 overflow-hidden grid place-items-center aspect-video text-gray-500 text-sm">
-                  Waiting for others to join...
-                </div>
+                userType !== 'normal' && showAvatar && (
+                  <div className="bg-white rounded-2xl shadow-md ring-1 ring-gray-200 overflow-hidden grid place-items-center aspect-video text-gray-500 text-sm">
+                    Waiting for others to join...
+                  </div>
+                )
               )}
             </div>
           </div>
@@ -1870,17 +2082,16 @@ const IntegratedRoom = () => {
 
       {/* Persistent Native Speech Recognition - Controlled by Toggle */}
       {/* Persistent Native Speech Recognition - Now hidden but active */}
-      {/* Persistent Native Speech Recognition - Controlled by Toggle or Summary */}
-      {(isBackgroundListening || isSummaryEnabled) && (
-        <div className="fixed bottom-4 right-4 z-40 opacity-0 pointer-events-none w-1 h-1 overflow-hidden">
-          <NativeSpeechRecognition
-            onTextChange={handleTextChange}
-            onFinalResult={handleFinalSpeech}
-            onListeningChange={handleListeningChange}
-            language={preferredLanguageRef.current || 'en-US'}
-          />
-        </div>
-      )}
+      <div className="fixed bottom-4 right-4 z-40 opacity-0 pointer-events-none w-1 h-1 overflow-hidden">
+        <NativeSpeechRecognition
+          onTextChange={handleTextChange}
+          onFinalResult={handleFinalSpeech}
+          onListeningChange={handleListeningChange}
+          language={preferredLanguageRef.current || 'en-US'}
+          isMuted={isMuted || isTTSPlaying}
+          isActive={isBackgroundListening || isSummaryEnabled || userType === 'normal' || showTranscripts}
+        />
+      </div>
 
       {/* Global Notifications / Chat Overlay */}
       {showChat && (
@@ -1981,7 +2192,21 @@ const IntegratedRoom = () => {
         </div>
       )}
 
-      {/* STT Modal Removed - Replaced by Bottom Bar Control */}
+      {/* Persistent Native Speech Recognition - Hidden but active */}
+      {/* Only render when Voice-to-Sign or Summary is active AND multilingual is NOT active */}
+      {/* Chrome only allows ONE SpeechRecognition instance — multilingual has its own */}
+      {(isBackgroundListening || isSummaryEnabled) && !isTranslationEnabled && (
+        <div className="fixed bottom-4 right-4 z-40 opacity-0 pointer-events-none w-1 h-1 overflow-hidden">
+          <NativeSpeechRecognition
+            onTextChange={handleTextChange}
+            onFinalResult={handleFinalSpeech}
+            onListeningChange={handleListeningChange}
+            language={preferredLanguage}
+            isMuted={isMuted || isTTSPlaying}
+            isActive={isBackgroundListening || isSummaryEnabled}
+          />
+        </div>
+      )}
 
       {/* Participants Popup Modal */}
       {showParticipants && (
@@ -2011,6 +2236,66 @@ const IntegratedRoom = () => {
                   </div>
                 ))}
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Live Transcript Popup Modal */}
+      {showTranscripts && (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-[80vh] flex flex-col">
+            <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200">
+              <h2 className="text-xl font-bold text-gray-900 flex items-center gap-2 text-indigo-600">
+                <svg className="w-5 h-5 text-indigo-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" />
+                </svg>
+                Live Transcript
+              </h2>
+              <div className="flex items-center gap-3">
+                <div className="flex items-center gap-1.5 px-3 py-1 bg-gray-100 rounded-full">
+                  <span className={`w-2 h-2 rounded-full ${isSpeechActive ? 'bg-emerald-500 animate-pulse' : 'bg-gray-400'}`}></span>
+                  <span className="text-xs text-gray-600 font-medium">{isSpeechActive ? 'Listening' : 'Paused'}</span>
+                </div>
+                <button
+                  onClick={() => setShowTranscripts(false)}
+                  className="rounded-full p-2 hover:bg-gray-100 transition-colors"
+                >
+                  <svg className="w-6 h-6 text-gray-500" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+            <div className="flex-1 overflow-y-auto p-6 space-y-4 bg-gray-50/50">
+              {captions.length === 0 ? (
+                <div className="flex flex-col items-center justify-center h-full text-gray-400 opacity-70">
+                  <svg className="w-12 h-12 mb-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+                  </svg>
+                  <p className="text-sm font-medium">Start speaking to see live captions...</p>
+                </div>
+              ) : (
+                captions.map(c => {
+                  const isMe = c.speaker === 'You' || c.speaker === (userNameRef.current || user.name);
+                  return (
+                    <div key={c.id} className={`flex w-full ${isMe ? 'justify-start' : 'justify-end'}`}>
+                      <div className={`max-w-[85%] rounded-2xl px-4 py-3 shadow-sm ${isMe
+                        ? 'bg-indigo-600 text-white rounded-tl-sm'
+                        : 'bg-white border border-gray-200 text-gray-800 rounded-tr-sm'
+                        }`}>
+                        <div className={`text-xs font-bold uppercase tracking-wider mb-1 ${isMe ? 'text-indigo-200' : 'text-indigo-600'}`}>
+                          {c.speaker}
+                        </div>
+                        <p className="text-sm leading-relaxed">{c.text}</p>
+                        <div className={`text-[10px] mt-1.5 text-right ${isMe ? 'text-indigo-200/80' : 'text-gray-400'}`}>
+                          {c.timestamp}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })
+              )}
             </div>
           </div>
         </div>
@@ -2150,31 +2435,40 @@ const IntegratedRoom = () => {
             </svg>
           </button>
 
-          {/* Meeting Summary Toggle (Shared) */}
+          {/* Live Transcript Master Toggle */}
           <button
             onClick={() => {
               const newState = !isSummaryEnabled;
               console.log(`🎤 Toggling transcription to ${newState} for ALL users`);
-              // Optimistic update? No, let's wait for socket to ensure sync or do optimistic + sync.
-              // Better to trust the socket source of truth for "Shared" state to avoid race conditions.
-              // BUT for responsiveness, we can set it, and if socket fails, it reverts?
-              // Actually, safeguard: only emit if connected.
+
+              // 1. Immediately open the Modal UI if enabling
+              if (newState) {
+                setShowTranscripts(true);
+              }
+
+              // 2. Set Local State
+              setIsSummaryEnabled(newState);
+
+              // 3. Guarantee sync across room
               if (socketRef.current && socketRef.current.connected) {
                 socketRef.current.emit('toggle-transcription', { roomId, enabled: newState });
-              } else {
-                // Fallback for local testing if offline? OR just alert.
-                setIsSummaryEnabled(newState);
               }
             }}
             className={`rounded-full p-2.5 sm:p-4 transition-all duration-200 relative shrink-0 ${isSummaryEnabled ? 'bg-indigo-600 text-white shadow-lg' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}
             title={isSummaryEnabled ? "Disable Live Transcription (All)" : "Enable Live Transcription (All)"}
           >
-            <svg className="w-5 h-5 sm:w-6 sm:h-6" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-            </svg>
+            {isSummaryEnabled ? (
+              <svg className="w-5 h-5 sm:w-6 sm:h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" />
+              </svg>
+            ) : (
+              <svg className="w-5 h-5 sm:w-6 sm:h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" />
+              </svg>
+            )}
             {/* Active indicator */}
             {isSummaryEnabled && isSpeechActive && (
-              <div className="absolute -top-1 -right-1 w-3 h-3 bg-red-500 rounded-full animate-pulse" />
+              <div className="absolute -top-1 -right-1 w-3 h-3 border-2 border-white bg-red-500 rounded-full animate-pulse" />
             )}
           </button>
 
