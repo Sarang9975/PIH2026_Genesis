@@ -5,12 +5,15 @@ import io from 'socket.io-client';
 import api from '../lib/api';
 import SignLanguageAvatar from '../components/SignLanguageAvatar';
 import NativeSpeechRecognition from '../components/NativeSpeechRecognition';
-import TextInput from '../components/TextInput';
-import VideoWithPoseDetection from '../components/VideoWithPoseDetection'; // Keeping for legacy reference, can be removed if fully replaced
+import VideoWithPoseDetection from '../components/VideoWithPoseDetection'; // legacy fallback component
 import GeminiLiveStream from '../components/GeminiLiveStream';
 import { getSuggestions, nextSuggestion } from '../lib/suggest';
 import CallWidget from '../components/CallWidget';
 import LinzoLogo from '../assets/linzo-logo.png';
+
+// shared helpers and hooks
+import { makeChatMessage, makeCaption, isDuplicate as checkDuplicate } from '../lib/roomUtils';
+import { useTTS } from '../hooks/useTTS';
 
 const IntegratedRoom = () => {
   const { roomId } = useParams();
@@ -47,7 +50,8 @@ const IntegratedRoom = () => {
   const [isTranslationEnabled, setIsTranslationEnabled] = useState(false);
   const [preferredLanguage, setPreferredLanguage] = useState('en-US'); // Default to English (US)
   const [supportedLanguages, setSupportedLanguages] = useState([]);
-  const [isTTSPlaying, setIsTTSPlaying] = useState(false);
+  // TTS state and helper are handled by a custom hook now
+  const { isTTSPlaying, speakText, setTTSPlaying } = useTTS();
 
   // User Type & Accessibility State
   const [userType, setUserType] = useState(null); // 'normal', 'deaf', 'mute', null (unselected)
@@ -291,12 +295,10 @@ const IntegratedRoom = () => {
 
       if (data.text && data.text.trim()) {
         // Display transcription in chat
-        const message = {
-          id: Date.now(),
+        const message = makeChatMessage({
           text: `📞 Phone: "${data.text}"`,
-          sender: 'Twilio Call',
-          timestamp: new Date().toLocaleTimeString()
-        };
+          sender: 'Twilio Call'
+        });
         setChatMessages(prev => [...prev, message]);
 
         // Trigger sign language avatar animation
@@ -329,17 +331,12 @@ const IntegratedRoom = () => {
             return;
           }
 
-          const caption = {
-            id: Date.now() + Math.random(),
-            text: text,
-            speaker: data.speakerName || sender || 'Participant',
-            timestamp: new Date().toLocaleTimeString()
-          };
-
-          setCaptions(prev => {
-            console.log('➕ [TRANSCRIPT] Adding caption:', caption);
-            return [...prev, caption].slice(-50);
-          });
+          const caption = makeCaption(
+            text,
+            data.speakerName || sender || 'Participant'
+          );
+          console.log('➕ [TRANSCRIPT] Adding caption:', caption);
+          setCaptions(prev => [...prev, caption].slice(-50));
 
           recentTranscriptsRef.current.push({ text: text, source: 'remote', timestamp: Date.now() });
 
@@ -447,14 +444,14 @@ const IntegratedRoom = () => {
           const currentTime = audioCtx.currentTime;
           if (nextStartTime < currentTime) nextStartTime = currentTime;
 
-          setIsTTSPlaying(true);
-          source.onended = () => setIsTTSPlaying(false);
+          setTTSPlaying(true);
+          source.onended = () => setTTSPlaying(false);
           source.start(nextStartTime);
           nextStartTime += buffer.duration;
 
         } catch (e) {
           console.error("Global Audio Decode Error:", e);
-          setIsTTSPlaying(false);
+          setTTSPlaying(false);
         }
       }
     });
@@ -503,30 +500,9 @@ const IntegratedRoom = () => {
     });
   }, [isMuted, isVideoOff]);
 
-  // Helper to check for duplicates (Echo cancellation for meeting summary)
-  // MOVED UP or ENSURE ONLY ONE COPY EXISTS.
-  // Scanning file... I will keep this one and ensure no others exist.
+  // duplicate detection is delegated to shared util for reuse across rooms
   const isDuplicate = useCallback((text, excludeSource) => {
-    const now = Date.now();
-    // Clean up old entries (> 5 seconds)
-    recentTranscriptsRef.current = recentTranscriptsRef.current.filter(t => now - t.timestamp < 5000);
-
-    // Check for similarity
-    const normalizedNew = text.toLowerCase().trim();
-    return recentTranscriptsRef.current.some(t => {
-      if (t.source === excludeSource) return false; // Only check against the OTHER source
-      const normalizedExisting = t.text.toLowerCase().trim();
-
-      // Match if exactly the same
-      if (normalizedNew === normalizedExisting) return true;
-
-      // Match if one includes the other AND their lengths are very similar (e.g. slight transcription difference like "hello" vs "hello.")
-      if ((normalizedNew.includes(normalizedExisting) || normalizedExisting.includes(normalizedNew)) &&
-        Math.abs(normalizedNew.length - normalizedExisting.length) <= 3) {
-        return true;
-      }
-      return false;
-    });
+    return checkDuplicate(text, excludeSource, recentTranscriptsRef);
   }, []);
 
   // Monitor mode changes to restore base stream when both modes are off
@@ -767,104 +743,6 @@ const IntegratedRoom = () => {
   // Ref to track currently playing TTS audio
   const currentTTSAudioRef = useRef(null);
 
-  // Robust Speech Helper using Google TTS API (Bypasses flaky browser voices)
-  const speakText = useCallback((text, language) => {
-    if (!text) return;
-
-    // 1. Stop any existing audio playback to prevent echo/reverberation
-    if (currentTTSAudioRef.current) {
-      try {
-        currentTTSAudioRef.current.pause();
-        currentTTSAudioRef.current.currentTime = 0;
-        currentTTSAudioRef.current = null;
-      } catch (e) {
-        console.warn('Error stopping previous TTS audio:', e);
-      }
-    }
-
-    // 2. Stop any existing browser speech to be safe
-    if ('speechSynthesis' in window) {
-      window.speechSynthesis.cancel();
-    }
-
-    setIsTTSPlaying(true); // Set playing state when starting new audio
-
-    try {
-      // 3. Use our own SERVER PROXY to avoid browser blocking
-      // This hits http://localhost:5000/api/translate/tts which then fetches from Google
-      const langCode = (language || 'en').split('-')[0];
-      const encodedText = encodeURIComponent(text);
-
-      // Construct the proxy URL (ensure it points to backend)
-      const signalingOrigin = import.meta.env.VITE_SIGNALING_URL || 'http://localhost:5000';
-      const url = `${signalingOrigin.replace(/\/$/, '')}/api/translate/tts?text=${encodedText}&lang=${langCode}`;
-
-      // 4. Play Audio
-      const audio = new Audio(url);
-      audio.crossOrigin = "anonymous";
-
-      // Store reference to current audio
-      currentTTSAudioRef.current = audio;
-
-      console.log(`🔊 Fetching TTS from Proxy: "${text}" (${langCode})`);
-
-      // Safety timeout: if audio never fires ended/error, reset isTTSPlaying after 10s
-      const safetyTimeout = setTimeout(() => {
-        console.warn('⚠️ TTS safety timeout: resetting isTTSPlaying');
-        setIsTTSPlaying(false);
-        if (currentTTSAudioRef.current === audio) {
-          currentTTSAudioRef.current = null;
-        }
-      }, 10000);
-
-      // Clean up reference when audio finishes
-      audio.addEventListener('ended', () => {
-        clearTimeout(safetyTimeout);
-        setIsTTSPlaying(false); // Reset playing state on end
-        if (currentTTSAudioRef.current === audio) {
-          currentTTSAudioRef.current = null;
-        }
-      });
-
-      // Clean up reference on error
-      audio.addEventListener('error', () => {
-        clearTimeout(safetyTimeout);
-        setIsTTSPlaying(false); // Reset playing state on error
-        if (currentTTSAudioRef.current === audio) {
-          currentTTSAudioRef.current = null;
-        }
-      });
-
-      audio.play().then(() => {
-        console.log("✅ Audio Playing Successfully");
-      }).catch(err => {
-        console.error("❌ Audio Playback Failed (Proxy):", err);
-
-        // Clear the reference since proxy audio failed
-        if (currentTTSAudioRef.current === audio) {
-          currentTTSAudioRef.current = null;
-        }
-        setIsTTSPlaying(false); // Reset playing state if proxy audio fails
-
-        // Final Fallback to Browser
-        if ('speechSynthesis' in window) {
-          console.log("⚠️ Fallback to Browser Native TTS...");
-          const u = new SpeechSynthesisUtterance(text);
-          u.lang = language || 'en-US';
-          u.onstart = () => setIsTTSPlaying(true);
-          u.onend = () => setIsTTSPlaying(false);
-          u.onerror = () => setIsTTSPlaying(false);
-          window.speechSynthesis.speak(u);
-        } else {
-          setIsTTSPlaying(false); // If no fallback, ensure state is reset
-        }
-      });
-
-    } catch (e) {
-      console.error("❌ Google TTS setup failed:", e);
-      setIsTTSPlaying(false); // Reset playing state on setup failure
-    }
-  }, []);
 
   // Helper function to translate text
   const translateIncomingText = async (text) => {
@@ -944,12 +822,7 @@ const IntegratedRoom = () => {
   };
   const sendChatMessage = () => {
     if (chatInput.trim()) {
-      const message = {
-        id: Date.now(),
-        text: chatInput.trim(),
-        sender: 'You',
-        timestamp: new Date().toLocaleTimeString()
-      };
+      const message = makeChatMessage({ text: chatInput.trim(), sender: 'You' });
       setChatMessages(prev => [...prev, message]);
       setChatInput('');
 
@@ -958,7 +831,7 @@ const IntegratedRoom = () => {
         socketRef.current.emit('chat-message', {
           roomId,
           message: message.text,
-          sender: 'You'
+          sender: message.sender
         });
       }
     }
@@ -1002,27 +875,19 @@ const IntegratedRoom = () => {
       const currentUserName = userNameRef.current || user.name || 'You';
 
       // 1. Show locally immediately (Consistency)
-      const message = {
+      const message = makeChatMessage({
         id: messageId,
         text: text.trim(),
-        sender: currentUserName,
-        timestamp: new Date().toLocaleTimeString()
-      };
+        sender: currentUserName
+      });
 
       console.log(`🎤 [DEBUG] handleFinalSpeech - Sender: ${currentUserName}, SocketID: ${socketRef.current?.id}, SummaryEnabled: ${isSummaryEnabled}, BackgroundListening: ${isBackgroundListening}`);
 
       setChatMessages(prev => [...prev, message]);
 
       // ADDED: Populate Live Transcript immediately for SELF (Blue bubble)
-      setCaptions(prev => {
-        const newCaption = {
-          id: messageId,
-          text: text.trim(),
-          speaker: currentUserName, // Explicitly use the resolved name
-          timestamp: new Date().toLocaleTimeString()
-        };
-        return [...prev, newCaption].slice(-50);
-      });
+      const newCaption = makeCaption(text.trim(), currentUserName);
+      setCaptions(prev => [...prev, newCaption].slice(-50));
 
       // Also track for summary
       recentTranscriptsRef.current.push({
@@ -1885,46 +1750,6 @@ const IntegratedRoom = () => {
           )}
           {/* Right: Sidebar tiles - widened */}
           <div className={`w-full ${userType === 'normal' || !showAvatar ? 'flex-1 relative' : 'lg:w-[420px]'} flex flex-col gap-4`}>
-            {/* Rendered below as a modal instead */}
-            {/* Seamless Voice Recognition Info */}
-            {/* <div className="bg-white rounded-2xl p-4 border border-gray-200 shadow-sm">
-              <div className="flex items-center gap-2 mb-2">
-                <div className="w-6 h-6 rounded-full bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200 flex items-center justify-center">
-                  <span className="text-xs">🎤</span>
-                </div>
-                <span className="text-sm font-semibold text-gray-900">Seamless Voice Recognition</span>
-              </div>
-              <p className="text-xs text-gray-600 leading-relaxed">
-                Click the orange microphone button below to start automatic voice-to-sign language conversion.
-                Just speak naturally - no popups needed!
-              </p>
-              {isBackgroundListening && (
-                <div className="mt-2 flex items-center gap-1 text-xs text-emerald-700">
-                  <div className="w-2 h-2 bg-emerald-500 rounded-full animate-pulse"></div>
-                  <span>Active - Speaking will instantly convert to sign language</span>
-                </div>
-              )}
-            </div> */}
-
-            {/* Sign to Voice Info */}
-            {/* <div className="bg-white rounded-2xl p-4 border border-gray-200 shadow-sm">
-              <div className="flex items-center gap-2 mb-2">
-                <div className="w-6 h-6 rounded-full bg-purple-50 text-purple-700 ring-1 ring-purple-200 flex items-center justify-center">
-                  <span className="text-xs">🤟</span>
-                </div>
-                <span className="text-sm font-semibold text-gray-900">Sign to Voice (ISL)</span>
-              </div>
-              <p className="text-xs text-gray-600 leading-relaxed">
-                Click the purple hand button below to enable real-time ISL gesture detection on your camera feed.
-                The AI will overlay pose detection lines and convert your gestures to speech!
-              </p>
-              {isSignToVoiceActive && (
-                <div className="mt-2 flex items-center gap-1 text-xs text-purple-700">
-                  <div className="w-2 h-2 bg-purple-500 rounded-full animate-pulse"></div>
-                  <span>Active - ISL gestures will be converted to speech</span>
-                </div>
-              )}
-            </div> */}
             {/* Video Gallery Container */}
             <div className={`flex-1 overflow-y-auto pr-1 pb-4 flex ${userType === 'normal' || !showAvatar ? 'flex-row flex-wrap justify-center content-start' : 'flex-col'} gap-4`}>
               {/* Local tile */}

@@ -4,6 +4,8 @@ import io from 'socket.io-client';
 import SmartReplyPanel from '../components/SmartReplyPanel';
 import CallWidget from '../components/CallWidget';
 import LinzoLogo from '../assets/linzo-logo.png';
+import { useTTS } from '../hooks/useTTS';
+
 
 export default function MultiCallRoom() {
   const { roomId } = useParams();
@@ -180,7 +182,7 @@ export default function MultiCallRoom() {
 
   // SIMPLE VOICE TRANSLATION SYSTEM - REWRITTEN FROM SCRATCH
   const [isTranslating, setIsTranslating] = useState(false);
-  const [isSpeaking, setIsSpeaking] = useState(false);
+  const { isTTSPlaying, speakText, setTTSPlaying } = useTTS();
   // Localized labels for summary (translated to user's preferred language)
   const [summaryLabels, setSummaryLabels] = useState({ you: 'You', peer: 'Other participant' });
 
@@ -257,207 +259,6 @@ export default function MultiCallRoom() {
       return text;
     } finally {
       setIsTranslating(false);
-    }
-  };
-
-  // Enhanced TTS function with better error handling and voice loading
-  const speakText = (text, lang) => {
-    if (!text || text.trim().length === 0) {
-      console.log('🔊 [TTS] Empty text, skipping TTS');
-      return;
-    }
-
-    if (!window.speechSynthesis) {
-      console.error('🔊 [TTS] ❌ Speech synthesis not available');
-      return;
-    }
-
-    console.log(`🔊 [TTS] Starting TTS: "${text}" in ${lang}`);
-    console.log(`🔊 [TTS] Speech synthesis available:`, !!window.speechSynthesis);
-    console.log(`🔊 [TTS] Currently speaking:`, window.speechSynthesis.speaking);
-
-    // Function to actually speak (called after voices are loaded)
-    const doSpeak = () => {
-      try {
-        // Stop any current speech
-        window.speechSynthesis.cancel();
-
-        // Wait a moment for cancellation
-        setTimeout(() => {
-          try {
-            // Create new speech
-            const utterance = new SpeechSynthesisUtterance(text.trim());
-            utterance.lang = lang;
-            utterance.rate = 0.9;
-            utterance.volume = 1.0;
-            utterance.pitch = 1.0;
-
-            console.log(`🔊 [TTS] Utterance created:`, {
-              text: utterance.text,
-              lang: utterance.lang,
-              rate: utterance.rate,
-              volume: utterance.volume
-            });
-
-            // Get available voices (may need to be called multiple times)
-            let voices = window.speechSynthesis.getVoices();
-            console.log(`🔊 [TTS] Available voices:`, voices.length);
-
-            // If no voices, wait a bit and try again (voices load asynchronously)
-            if (voices.length === 0) {
-              console.log('🔊 [TTS] No voices available yet, waiting...');
-              setTimeout(() => {
-                voices = window.speechSynthesis.getVoices();
-                console.log(`🔊 [TTS] Voices after wait:`, voices.length);
-                if (voices.length > 0) {
-                  selectAndSpeak(voices, utterance);
-                } else {
-                  // Speak without voice selection
-                  console.log('🔊 [TTS] Speaking without voice selection');
-                  setupUtterance(utterance);
-                  window.speechSynthesis.speak(utterance);
-                }
-              }, 500);
-              return;
-            }
-
-            selectAndSpeak(voices, utterance);
-
-          } catch (error) {
-            console.error('🔊 [TTS] ❌ Failed to create utterance:', error);
-            setIsSpeaking(false);
-          }
-        }, 50);
-      } catch (error) {
-        console.error('🔊 [TTS] ❌ Error in doSpeak:', error);
-        setIsSpeaking(false);
-      }
-    };
-
-    // Helper function to select voice and speak
-    const selectAndSpeak = (voices, utterance) => {
-      // Try to find a voice for the language
-      const langCode = lang.split('-')[0].toLowerCase(); // Get base language code (e.g., 'hi' from 'hi-IN')
-
-      // Map language codes to common TTS language formats
-      const langMap = {
-        'hi': 'hi-IN',
-        'en': 'en-US',
-        'es': 'es-ES',
-        'fr': 'fr-FR',
-        'de': 'de-DE',
-        'ja': 'ja-JP',
-        'ko': 'ko-KR',
-        'zh': 'zh-CN'
-      };
-
-      const ttsLang = langMap[langCode] || lang;
-      utterance.lang = ttsLang; // Set proper TTS language format
-
-      console.log(`🔊 [TTS] Looking for voice with lang: ${ttsLang} (code: ${langCode})`);
-
-      const targetVoice = voices.find(voice =>
-        voice.lang.toLowerCase().startsWith(langCode) && voice.localService
-      ) || voices.find(voice =>
-        voice.lang.toLowerCase().startsWith(langCode)
-      ) || voices.find(voice =>
-        voice.lang.toLowerCase().includes(langCode)
-      ) || voices.find(voice =>
-        voice.lang.toLowerCase().includes(ttsLang.toLowerCase())
-      ) || voices[0];
-
-      if (targetVoice) {
-        utterance.voice = targetVoice;
-        console.log(`🔊 [TTS] Using voice: ${targetVoice.name} (${targetVoice.lang})`);
-      } else {
-        console.log(`🔊 [TTS] Using default voice for ${ttsLang}`);
-        if (voices.length > 0) {
-          console.log(`🔊 [TTS] Available voices:`, voices.map(v => `${v.name} (${v.lang})`).slice(0, 5));
-        }
-      }
-
-      setupUtterance(utterance);
-
-      console.log(`🔊 [TTS] About to call speechSynthesis.speak()...`);
-      console.log(`🔊 [TTS] Utterance details:`, {
-        text: utterance.text.substring(0, 50),
-        lang: utterance.lang,
-        voice: utterance.voice?.name || 'default'
-      });
-
-      try {
-        window.speechSynthesis.speak(utterance);
-        console.log(`🔊 [TTS] speak() called successfully`);
-      } catch (speakError) {
-        console.error(`🔊 [TTS] ❌ Error calling speak():`, speakError);
-        setIsSpeaking(false);
-      }
-
-      // Verify TTS started
-      setTimeout(() => {
-        if (window.speechSynthesis.speaking) {
-          console.log('🔊 [TTS] ✅ Confirmed: TTS is speaking');
-        } else {
-          console.log('🔊 [TTS] ⚠️ TTS may not have started - check browser autoplay policies');
-          console.log('🔊 [TTS] ⚠️ Try clicking "Activate Translation" button to unlock audio');
-        }
-      }, 300);
-    };
-
-    // Helper function to setup utterance event handlers
-    const setupUtterance = (utterance) => {
-      utterance.onstart = () => {
-        console.log('🔊 [TTS] ✅ Started speaking successfully');
-        setIsSpeaking(true);
-      };
-
-      utterance.onend = () => {
-        console.log('🔊 [TTS] ✅ Finished speaking');
-        setIsSpeaking(false);
-      };
-
-      utterance.onerror = (e) => {
-        console.error('🔊 [TTS] ❌ Error:', e);
-        console.error('🔊 [TTS] Error details:', {
-          error: e.error,
-          type: e.type,
-          charIndex: e.charIndex,
-          message: e.message
-        });
-        setIsSpeaking(false);
-      };
-
-      utterance.onpause = () => {
-        console.log('🔊 [TTS] ⏸️ Paused');
-      };
-
-      utterance.onresume = () => {
-        console.log('🔊 [TTS] ▶️ Resumed');
-      };
-    };
-
-    // Check if voices are already loaded
-    let voices = window.speechSynthesis.getVoices();
-    if (voices.length > 0) {
-      doSpeak();
-    } else {
-      // Wait for voices to load
-      console.log('🔊 [TTS] Waiting for voices to load...');
-      const onVoicesChanged = () => {
-        console.log('🔊 [TTS] Voices loaded');
-        window.speechSynthesis.removeEventListener('voiceschanged', onVoicesChanged);
-        doSpeak();
-      };
-      window.speechSynthesis.addEventListener('voiceschanged', onVoicesChanged);
-
-      // Fallback: try after a delay even if voiceschanged doesn't fire
-      setTimeout(() => {
-        window.speechSynthesis.removeEventListener('voiceschanged', onVoicesChanged);
-        if (window.speechSynthesis.getVoices().length === 0) {
-          console.log('🔊 [TTS] Voices still not loaded, proceeding anyway');
-        }
-        doSpeak();
-      }, 1000);
     }
   };
 

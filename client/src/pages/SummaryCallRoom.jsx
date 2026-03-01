@@ -3,6 +3,8 @@ import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import io from 'socket.io-client';
 import api from '../lib/api';
 import LinzoLogo from '../assets/linzo-logo.png';
+import { isDuplicate as checkDuplicate, makeCaption } from '../lib/roomUtils';
+
 
 export default function SummaryCallRoom() {
     const { roomId } = useParams();
@@ -53,20 +55,8 @@ export default function SummaryCallRoom() {
         }
     }, [params]);
 
-    // Helper to check for duplicates (Echo cancellation / Same machine testing)
-    const isDuplicate = (text, excludeSource) => {
-        const now = Date.now();
-        // Clean up old entries (> 5 seconds)
-        recentTranscriptsRef.current = recentTranscriptsRef.current.filter(t => now - t.timestamp < 5000);
-
-        // Check for similarity
-        const normalizedNew = text.toLowerCase().trim();
-        return recentTranscriptsRef.current.some(t => {
-            if (t.source === excludeSource) return false; // Only check against the OTHER source
-            const normalizedExisting = t.text.toLowerCase().trim();
-            return normalizedNew.includes(normalizedExisting) || normalizedExisting.includes(normalizedNew);
-        });
-    };
+    // reuse shared duplicate detector
+    const isDuplicate = (text, excludeSource) => checkDuplicate(text, excludeSource, recentTranscriptsRef);
 
     // Fetch current user name
     useEffect(() => {
@@ -120,12 +110,10 @@ export default function SummaryCallRoom() {
                     return;
                 }
 
-                const caption = {
-                    id: Date.now() + Math.random(),
-                    text: data.text,
-                    speaker: data.speakerName || ('Participant ' + data.from.slice(0, 4)),
-                    timestamp: new Date().toLocaleTimeString()
-                };
+                const caption = makeCaption(
+                    data.text,
+                    data.speakerName || ('Participant ' + data.from.slice(0, 4))
+                );
 
                 setCaptions(prev => [...prev, caption].slice(-50));
                 recentTranscriptsRef.current.push({ text: data.text, source: 'remote', timestamp: Date.now() });
@@ -214,12 +202,7 @@ export default function SummaryCallRoom() {
                 }
 
                 // Add to local captions
-                const caption = {
-                    id: Date.now(),
-                    text,
-                    speaker: 'You',
-                    timestamp: new Date().toLocaleTimeString()
-                };
+                const caption = makeCaption(text, 'You');
                 setCaptions(prev => [...prev, caption].slice(-50));
                 recentTranscriptsRef.current.push({ text, source: 'local', timestamp: Date.now() });
 
